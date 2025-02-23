@@ -1,0 +1,3 @@
+[submodule "highlight_and_timestamps"]
+	path = highlight_and_timestamps
+	url = https://github.com/kullanici_adin/highlight_and_timestamps.git
