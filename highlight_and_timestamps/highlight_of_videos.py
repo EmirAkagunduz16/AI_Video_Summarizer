@@ -267,7 +267,6 @@ else:
     print("No highlights generated.")
 
 # https://youtu.be/3ec3B0cjOMs?si=6uccJDZ_HIxLNK7o (mini english podcast)
-# https://youtu.be/9xYdYbz9THg?si=GWuzjfsWOOdG_mnE (english podcast)
 # https://youtu.be/n4LCbWCshdw?si=NmRfL9l1vH5C1R03 (baris ozcan)
 # https://youtu.be/Gc0yVaM-ADY?si=X0oxq2IpmnYjPE4o (gs)
 # https://youtu.be/aKSHgMqCwbQ?si=wAL3xcFxorOkgCoQ (spain)
