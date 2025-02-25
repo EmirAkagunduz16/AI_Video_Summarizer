@@ -6,3 +6,6 @@ __pycache__/
 
 # Data folder
 data/
+
+.env
+downloads/
