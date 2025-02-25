@@ -23,16 +23,6 @@ MIN_TIME_GAP = 5
 min_clip_duration = 2  
 max_clip_duration = 40
 
-processor = Process()
-
-video = VideoFileClip(processor.video_path)
-video_duration = video.duration
-video.close()  
-
-used_segments = set()
-used_intervals = []
-
-
 def debug_segment_info(seg, similarity, conflict, used_intervals):
     print(f"\nSegment:")
     print(f"Text: {seg['text'][:100]}...")
@@ -44,72 +34,103 @@ def debug_segment_info(seg, similarity, conflict, used_intervals):
     print(f"Status: {'Selected' if similarity >= similarity_threshold and not conflict else 'Rejected'}")
 
 
-
 class Highlighting:
-  def __init__(self):
-    pass
-  
-  def generate_highlight(self):
-    client = Groq(api_key=highlight_api_key)
-    self.response = client.chat.completions.create(
-        model="qwen-2.5-32b",
-        messages=[
-            {
-                "role": "system",
-                "content": "Analyze this transcript and extract the most important moments. Focus on actions, events, or statements that are significant to the context of the content. Be concise and limit the summary to 5-7 key moments."
-            },
-            {
-                "role": "user",
-                "content": processor.transcription_text
-            }
-        ],
-        temperature=0.6,
-        max_completion_tokens=4096,
-        top_p=0.95,
-        stream=False,
-        stop=None,
-    )
-  
-  def highlight_parsing(self):
-    raw_highlights = self.response.choices[0].message.content
-    response_message = []
-    for line in raw_highlights.split('\n'):
-        line = re.sub(r'^(\d+[\.\)]?|[-*])\s*', '', line.strip())  # Remove numbering/bullets
-        if line:
-            response_message.append(line)
-    return response_message
-  
-  def select_segments_for_highlight(self, highlight, sorted_splitted_long_segments, used_intervals, model, similarity_threshold, MAX_SEGMENTS_PER_HIGHLIGHT, MIN_TIME_GAP):
-    best_matches = []
-    highlight_embed = model.encode(highlight)
-    
-    for seg in sorted_splitted_long_segments:
-        conflict = any(
-            (seg['start'] >= (u_start - MIN_TIME_GAP)) and 
-            (seg['start'] <= (u_end + MIN_TIME_GAP))
-            for u_start, u_end in used_intervals
+   
+    def generate_highlight(self, transcription_text):
+        client = Groq(api_key=highlight_api_key)
+        self.response = client.chat.completions.create(
+            model="qwen-2.5-32b",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Analyze this transcript and extract the most important moments. Focus on actions, events, or statements that are significant to the context of the content. Be concise and limit the summary to 5-7 key moments."
+                },
+                {
+                    "role": "user",
+                    "content": transcription_text
+                }
+            ],
+            temperature=0.6,
+            max_completion_tokens=4096,
+            top_p=0.95,
+            stream=False,
+            stop=None,
         )
+    
+    def highlight_parsing(self):
+        raw_highlights = self.response.choices[0].message.content
+        response_message = []
+        for line in raw_highlights.split('\n'):
+            line = re.sub(r'^(\d+[\.\)]?|[-*])\s*', '', line.strip())  # Remove numbering/bullets
+            if line:
+                response_message.append(line)
+        return response_message
+    
+    def select_segments_for_highlight(self, highlight, sorted_splitted_long_segments, used_intervals, model, similarity_threshold, MAX_SEGMENTS_PER_HIGHLIGHT, MIN_TIME_GAP):
+        best_matches = []
+        highlight_embed = model.encode(highlight)
         
-        seg_embed = model.encode(seg['text'])
-        similarity = cosine_similarity([highlight_embed], [seg_embed])[0][0]
+        for seg in sorted_splitted_long_segments:
+            conflict = any(
+                (seg['start'] >= (u_start - MIN_TIME_GAP)) and 
+                (seg['start'] <= (u_end + MIN_TIME_GAP))
+                for u_start, u_end in used_intervals
+            )
+            
+            seg_embed = model.encode(seg['text'])
+            similarity = cosine_similarity(highlight_embed.reshape(1, -1), seg_embed.reshape(1, -1))[0][0]
+
+
+            
+            debug_segment_info(seg, similarity, conflict, used_intervals)
+
+            if similarity >= similarity_threshold and not conflict:
+                best_matches.append((similarity, seg))
         
-        debug_segment_info(seg, similarity, conflict, used_intervals)
+        best_matches.sort(reverse=True, key=lambda x: x[0])
+        
+        selected = []
+        for sim, seg in best_matches:
+            if len(selected) >= MAX_SEGMENTS_PER_HIGHLIGHT:
+                break
+            selected.append(seg)
+            used_intervals.append((seg['start'], seg['end']))
+        
+        return selected
 
-        if similarity >= similarity_threshold and not conflict:
-            best_matches.append((similarity, seg))
-    
-    best_matches.sort(reverse=True, key=lambda x: x[0])
-    
-    selected = []
-    for sim, seg in best_matches:
-        if len(selected) >= MAX_SEGMENTS_PER_HIGHLIGHT:
-            break
-        selected.append(seg)
-        used_intervals.append((seg['start'], seg['end']))
-    
-    return selected
+    def create_highlight_video(self, selected_segments, video_path):
+        video = VideoFileClip(video_path)
+        clips = []
+        for seg in sorted(selected_segments, key=lambda x: x['start']):
+            try:
+                clip = video.subclipped(seg['start'], seg['end'])
+                clips.append(clip)
+            except Exception as e:
+                print(f"Error processing clip {seg}: {str(e)}")
 
-
+        if clips:
+            final_clip = concatenate_videoclips(clips)
+            if video.filename.startswith('http'):
+              parsed = urlparse(video_path)
+              base_name = os.path.splitext(unquote(parsed.path))[0]
+            else:
+                base_name = os.path.splitext(video_path)[0]
+            output_path = f"{base_name}_highlight.mp4"
+            
+            final_clip.write_videofile(
+                output_path,
+                codec="libx264",
+                fps=24,
+                preset='fast',
+                threads=4
+            )
+            print(f"Highlight video saved to: {output_path}")
+            final_clip.preview()
+            return output_path
+        else:
+            print("No valid clips to process.")
+            return None
+    
 
 class Segment:
   
@@ -161,38 +182,60 @@ class Segment:
   
 
 def main():
-  highlight_obj = Highlighting()
-  highlight_obj.generate_highlight()
-  response_message = highlight_obj.highlight_parsing()
-  
-  model = SentenceTransformer("all-mpnet-base-v2")
+    process = Process()
 
-  # Split all transcription segments
-  split_segments = []
-  for segment in processor.transcription_segments:
-      split_segments.extend(Segment.split_segment(segment))
+    mp4_url = input('Url: ')
 
-  valid_segments = [s for s in split_segments if s['end'] > s['start'] and s['text'].strip()]
+    is_download = input('Did you give the this url before? Y/n: ').lower()
 
-  # Split long segments and sort
-  valid_long_segments = Segment.split_long_segments(valid_segments)
-  sorted_splitted_long_segments = sorted(valid_long_segments, key=lambda x: x['start'])
-
-
-
-  for highlight_idx, highlight in enumerate(response_message, 1):
-    print(f"\n{'='*50}")
-    print(f"PROCESSING HIGHLIGHT {highlight_idx}/{len(response_message)}")
-    print(f"Highlight Text: {highlight[:150]}...")
+    if is_download == "y":
+        is_downloaded = True
+    elif is_download == "n":
+        is_downloaded = False
+    else:
+        print('Wrong key!')
+        sys.exit(0)
+        
+        
+    process.process_all(mp4_url, is_downloaded)
+    video = VideoFileClip(process.video_path)
+    video_duration = video.duration
+    video.close()  
+    used_intervals = []
     
+    
+    highlight_obj = Highlighting()
+    highlight_obj.generate_highlight(process.transcription_text)
+    response_message = highlight_obj.highlight_parsing()
+
+    model = SentenceTransformer("all-mpnet-base-v2")
+
+    # Split all transcription segments
+    split_segments = []
+    for segment in process.transcription_segments:
+        split_segments.extend(Segment.split_segment(segment))
+
+    valid_segments = [s for s in split_segments if s['end'] > s['start'] and s['text'].strip()]
+
+    # Split long segments and sort
+    valid_long_segments = Segment.split_long_segments(valid_segments)
+    sorted_splitted_long_segments = sorted(valid_long_segments, key=lambda x: x['start'])
+
+
+
+    for highlight_idx, highlight in enumerate(response_message, 1):
+        print(f"\n{'='*50}")
+        print(f"PROCESSING HIGHLIGHT {highlight_idx}/{len(response_message)}")
+        print(f"Highlight Text: {highlight[:150]}...")
+
     selected = highlight_obj.select_segments_for_highlight(highlight, sorted_splitted_long_segments, used_intervals, model, similarity_threshold, MAX_SEGMENTS_PER_HIGHLIGHT, MIN_TIME_GAP)
-    
+
     print(f"\nSelected Segments ({len(selected)}):")
     for seg in selected:
         start = max(0, seg['start'] - 1)
         end = min(seg['end'] + 1, video_duration)
         print(f"• {start:.1f}s-{end:.1f}s ({end-start:.1f}s) | {seg['text'][:50]}...")
-    
+
     for seg in selected:
         start = max(0, seg['start'] - 1)
         end = min(seg['end'] + 1, video_duration)
@@ -205,55 +248,26 @@ def main():
         })
 
 
-  filtered_highlight_segments = [
-      segment for segment in highlight_segments
-      if segment['end'] - segment['start'] >= min_clip_duration
-      and segment['end'] - segment['start'] <= max_clip_duration
-      and segment['start'] < segment['end']
-  ]
-  filtered_highlight_segments = sorted(
-      filtered_highlight_segments,
-      key=lambda x: x['start']
-  )
+    filtered_highlight_segments = [
+        segment for segment in highlight_segments
+        if segment['end'] - segment['start'] >= min_clip_duration
+        and segment['end'] - segment['start'] <= max_clip_duration
+        and segment['start'] < segment['end']
+    ]
+    filtered_highlight_segments = sorted(
+        filtered_highlight_segments,
+        key=lambda x: x['start']
+    )
 
-  if filtered_highlight_segments:
-      video = VideoFileClip(processor.video_path)
-      clips = []
-      for seg in sorted(highlight_segments, key=lambda x: x['start']):
-          try:
-              clip = video.subclipped(seg['start'], seg['end'])
-              clips.append(clip)
-          except Exception as e:
-              print(f"Error processing clip {seg}: {str(e)}")
-      
-      if clips:
-          final_clip = concatenate_videoclips(clips)
-          # Generate safe filename
-          if video.filename.startswith('http'):
-              parsed = urlparse(processor.video_path)
-              base_name = os.path.splitext(unquote(parsed.path))[0]
-          else:
-              base_name = os.path.splitext(processor.video_path)[0]
-          output_path = f"{base_name}_highlight.mp4"
-          
-          final_clip.write_videofile(
-              output_path,
-              codec="libx264",
-              fps=24,
-              preset='fast',
-              threads=4
-          )
-          print(f"Highlight video saved to: {output_path}")
-          final_clip.preview()
-      else:
-          print("No valid clips to process.")
-  else:
-      print("No highlights generated.")
+    if filtered_highlight_segments:
+        highlight_obj.create_highlight_video(filtered_highlight_segments, process.video_path)
+    else:
+        print("No highlights generated.")
   
 if __name__ == "__main__":
   main()
 
-# https://youtu.be/3ec3B0cjOMs?si=6uccJDZ_HIxLNK7o (mini english podcast)
-# https://youtu.be/n4LCbWCshdw?si=NmRfL9l1vH5C1R03 (baris ozcan)
-# https://youtu.be/Gc0yVaM-ADY?si=X0oxq2IpmnYjPE4o (gs)
-# https://youtu.be/aKSHgMqCwbQ?si=wAL3xcFxorOkgCoQ (spain)
+# # https://youtu.be/3ec3B0cjOMs?si=6uccJDZ_HIxLNK7o (mini english podcast)
+# # https://youtu.be/n4LCbWCshdw?si=NmRfL9l1vH5C1R03 (baris ozcan)
+# # https://youtu.be/Gc0yVaM-ADY?si=X0oxq2IpmnYjPE4o (gs)
+# # https://youtu.be/aKSHgMqCwbQ?si=wAL3xcFxorOkgCoQ (spain)

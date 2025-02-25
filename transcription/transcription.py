@@ -18,7 +18,7 @@ class VideoTranscriber:
 
 
   def download_video(self, url: str, download: bool=False) -> str:
-    file_name = re.sub(r'[<>:"/\\|?*]', '', url.split("/")[-1])
+    file_name = re.sub(r'[<>:"/\\|?*]', '', url.split("/")[-1]).strip()  # Fazladan boşlukları temizle
     file_path = os.path.join(self.download_dir, file_name + ".mp4")
 
     ydl_opts = {
