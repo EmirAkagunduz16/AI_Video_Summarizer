@@ -1,0 +1,8 @@
+# Python cache files
+__pycache__/
+*.pyc
+
+*.csv
+
+# Data folder
+data/
