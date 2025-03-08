@@ -16,22 +16,22 @@ highlight_api_key = os.getenv('HIGHLIGHT_API_KEY')
 
 
 #### Highlight hyperparameters ####
-highlight_segments = []
-similarity_threshold = 0.5
-MAX_SEGMENTS_PER_HIGHLIGHT = 2  
-MIN_TIME_GAP = 5
-min_clip_duration = 2  
-max_clip_duration = 40
+similarity_threshold = 0.35  # Further lowered for better matching
+MAX_SEGMENTS_PER_HIGHLIGHT = 3  # Increased to allow more segments per highlight
+MIN_TIME_GAP = 2.0  # Reduced to allow closer segments
+min_clip_duration = 3.0
+max_clip_duration = 30.0  # Reduced to avoid too long clips
 
 def debug_segment_info(seg, similarity, conflict, used_intervals):
-    print(f"\nSegment:")
+    print(f"\nSegment Analysis:")
     print(f"Text: {seg['text'][:100]}...")
-    print(f"Time: {seg['start']:.1f}s - {seg['end']:.1f}s")
-    print(f"Similarity: {similarity:.2f}")
-    print(f"Conflict: {'Yes' if conflict else 'No'}")
+    print(f"Time: {seg['start']:.1f}s - {seg['end']:.1f}s (Duration: {seg['end']-seg['start']:.1f}s)")
+    print(f"Similarity Score: {similarity:.3f} (Threshold: {similarity_threshold})")
+    print(f"Overlap Check: {'Failed' if conflict else 'Passed'}")
     if conflict:
-        print(f"Conflicting Intervals: {used_intervals}")
-    print(f"Status: {'Selected' if similarity >= similarity_threshold and not conflict else 'Rejected'}")
+        print(f"Overlapping with: {used_intervals}")
+    print(f"Final Decision: {'✓ Selected' if similarity >= similarity_threshold and not conflict else '✗ Rejected'}")
+    print("-" * 50)
 
 
 class Highlighting:
@@ -67,84 +67,168 @@ class Highlighting:
         return response_message
     
     def select_segments_for_highlight(self, highlight, sorted_splitted_long_segments, used_intervals, model, similarity_threshold, MAX_SEGMENTS_PER_HIGHLIGHT, MIN_TIME_GAP):
-        best_matches = []
-        highlight_embed = model.encode(highlight)
-        
-        for seg in sorted_splitted_long_segments:
-            conflict = any(
-                (seg['start'] >= (u_start - MIN_TIME_GAP)) and 
-                (seg['start'] <= (u_end + MIN_TIME_GAP))
-                for u_start, u_end in used_intervals
-            )
-            
-            seg_embed = model.encode(seg['text'])
-            similarity = cosine_similarity(highlight_embed.reshape(1, -1), seg_embed.reshape(1, -1))[0][0]
-
-
-            
-            debug_segment_info(seg, similarity, conflict, used_intervals)
-
-            if similarity >= similarity_threshold and not conflict:
-                best_matches.append((similarity, seg))
-        
-        best_matches.sort(reverse=True, key=lambda x: x[0])
-        
         selected = []
-        for sim, seg in best_matches:
+        highlight_embedding = model.encode([highlight])[0]
+        
+        # First pass: Find segments with high similarity
+        for segment in sorted_splitted_long_segments:
             if len(selected) >= MAX_SEGMENTS_PER_HIGHLIGHT:
                 break
-            selected.append(seg)
-            used_intervals.append((seg['start'], seg['end']))
+                
+            # Skip if segment text is too short
+            if len(segment['text'].split()) < 3:
+                continue
+                
+            # Calculate similarity
+            segment_embedding = model.encode([segment['text']])[0]
+            similarity = np.dot(highlight_embedding, segment_embedding)
+            
+            # Check for conflicts with previously used intervals
+            conflict = any(
+                max(segment['start'], used_start) <= min(segment['end'], used_end)
+                for used_start, used_end in used_intervals
+            )
+            
+            # Adjust similarity threshold for key moments
+            adjusted_threshold = similarity_threshold
+            if any(keyword in highlight.lower() for keyword in ['goal', 'score', 'win', 'victory', 'champion']):
+                adjusted_threshold = similarity_threshold * 0.8  # Lower threshold for key moments
+            
+            if similarity >= adjusted_threshold and not conflict:
+                # Extend segment time slightly to capture context
+                start = max(0, segment['start'] - 1)
+                end = segment['end'] + 1
+                
+                # Add to selected segments
+                selected.append({
+                    'start': start,
+                    'end': end,
+                    'text': segment['text'],
+                    'similarity': similarity
+                })
+                
+                # Add to used intervals
+                used_intervals.append((start, end))
+                
+                debug_segment_info(segment, similarity, conflict, used_intervals)
+                
+        # Second pass: If no segments were selected, try with a lower threshold
+        if not selected and any(keyword in highlight.lower() for keyword in ['goal', 'score', 'win', 'victory', 'champion']):
+            for segment in sorted_splitted_long_segments:
+                if len(selected) >= MAX_SEGMENTS_PER_HIGHLIGHT:
+                    break
+                    
+                segment_embedding = model.encode([segment['text']])[0]
+                similarity = np.dot(highlight_embedding, segment_embedding)
+                
+                conflict = any(
+                    max(segment['start'], used_start) <= min(segment['end'], used_end)
+                    for used_start, used_end in used_intervals
+                )
+                
+                if similarity >= similarity_threshold * 0.7 and not conflict:  # Even lower threshold for second pass
+                    start = max(0, segment['start'] - 1)
+                    end = segment['end'] + 1
+                    selected.append({
+                        'start': start,
+                        'end': end,
+                        'text': segment['text'],
+                        'similarity': similarity
+                    })
+                    used_intervals.append((start, end))
+                    debug_segment_info(segment, similarity, conflict, used_intervals)
         
         return selected
 
     def create_highlight_video(self, selected_segments, video_path):
-        video = VideoFileClip(video_path)
-        clips = []
-        for seg in sorted(selected_segments, key=lambda x: x['start']):
-            try:
-                clip = video.subclipped(seg['start'], seg['end'])
-                clips.append(clip)
-            except Exception as e:
-                print(f"Error processing clip {seg}: {str(e)}")
-
-        if clips:
-            final_clip = concatenate_videoclips(clips)
-            if video.filename.startswith('http'):
-              parsed = urlparse(video_path)
-              base_name = os.path.splitext(unquote(parsed.path))[0]
-            else:
-                base_name = os.path.splitext(video_path)[0]
-            output_path = f"{base_name}_highlight.mp4"
+        try:
+            video = VideoFileClip(video_path)
+            clips = []
             
-            final_clip.write_videofile(
-                output_path,
-                codec="libx264",
-                fps=24,
-                preset='fast',
-                threads=4
-            )
-            print(f"Highlight video saved to: {output_path}")
-            final_clip.preview()
-            return output_path
-        else:
-            print("No valid clips to process.")
+            # Sort segments by start time
+            sorted_segments = sorted(selected_segments, key=lambda x: x['start'])
+            
+            for seg in sorted_segments:
+                try:
+                    # Ensure start and end times are valid numbers
+                    start_time = float(seg['start'])
+                    end_time = float(seg['end'])
+                    
+                    # Add some validation
+                    if start_time >= end_time:
+                        print(f"Invalid time range for segment: start={start_time}, end={end_time}")
+                        continue
+                        
+                    if start_time < 0:
+                        start_time = 0
+                    
+                    # Create subclip using the correct method name
+                    clip = video.subclipped(start_time, end_time)
+                    clips.append(clip)
+                    print(f"Successfully added clip from {start_time:.1f}s to {end_time:.1f}s")
+                except Exception as e:
+                    print(f"Error processing clip {seg}: {str(e)}")
+
+            if clips:
+                print(f"\nCreating final video from {len(clips)} clips...")
+                final_clip = concatenate_videoclips(clips)
+                if video.filename.startswith('http'):
+                    parsed = urlparse(video_path)
+                    base_name = os.path.splitext(unquote(parsed.path))[0]
+                else:
+                    base_name = os.path.splitext(video_path)[0]
+                output_path = f"{base_name}_highlight.mp4"
+                
+                try:
+                    final_clip.write_videofile(
+                        output_path,
+                        codec="libx264",
+                        fps=24,
+                        preset='fast',
+                        threads=4
+                    )
+                    print(f"\nHighlight video successfully saved to: {output_path}")
+                finally:
+                    # Properly close all clips
+                    final_clip.close()
+                    for clip in clips:
+                        clip.close()
+                    video.close()
+                return output_path
+            else:
+                print("No valid clips were created. Please check the segment times and video duration.")
+                return None
+        except Exception as e:
+            print(f"Error creating highlight video: {str(e)}")
             return None
+        finally:
+            # Ensure video is closed even if an error occurs
+            if 'video' in locals():
+                video.close()
     
 
 class Segment:
   
-  def split_long_segments(segments, max_duration=60):
+  def split_long_segments(segments, max_duration=30):  # Reduced max duration
     new_segments = []
     for seg in segments:
         duration = seg['end'] - seg['start']
         if duration > max_duration:
-            mid_point = seg['start'] + (duration/2)
-            new_segments.append({
-                'start': max(0, mid_point - 15),
-                'end': min(mid_point + 15, seg['end']),
-                'text': seg['text']
-            })
+            # Create smaller segments with small overlap
+            num_splits = int(np.ceil(duration / (max_duration - 5)))  # 5 second overlap
+            split_duration = duration / num_splits
+            
+            for i in range(num_splits):
+                split_start = seg['start'] + (i * (split_duration - 5))  # Overlap previous segment
+                split_end = min(split_start + split_duration, seg['end'])
+                
+                # Only add if duration is meaningful
+                if split_end - split_start >= min_clip_duration:
+                    new_segments.append({
+                        'start': max(0, split_start),
+                        'end': split_end,
+                        'text': seg['text']
+                    })
         else:
             new_segments.append(seg)
     return new_segments
@@ -179,75 +263,109 @@ class Segment:
         })
         chunk_start = chunk_end
     return chunks
-  
+
+
+
 
 def main():
+    similarity_threshold = 0.35
+    MAX_SEGMENTS_PER_HIGHLIGHT = 3  # Increased from default
+    MIN_TIME_GAP = 2.0
+    min_clip_duration = 3.0
+    max_clip_duration = 30.0
+    highlight_segments = []
+    
     process = Process()
-
-    mp4_url = input('Url: ')
-
-    is_download = input('Did you give the this url before? Y/n: ').lower()
-
-    if is_download == "y":
+    
+    print("Url: ", end="")
+    mp4_url = input()
+    
+    print("Did you give the this url before? Y/n: ", end="")
+    is_download = input()
+    
+    if is_download == "y" or is_download == "Y":
         is_downloaded = True
     elif is_download == "n":
         is_downloaded = False
     else:
         print('Wrong key!')
         sys.exit(0)
-        
-        
+    
     process.process_all(mp4_url, is_downloaded)
     video = VideoFileClip(process.video_path)
     video_duration = video.duration
-    video.close()  
+    video.close()
     used_intervals = []
-    
     
     highlight_obj = Highlighting()
     highlight_obj.generate_highlight(process.transcription_text)
     response_message = highlight_obj.highlight_parsing()
-
+    
     model = SentenceTransformer("all-mpnet-base-v2")
-
+    
     # Split all transcription segments
     split_segments = []
     for segment in process.transcription_segments:
         split_segments.extend(Segment.split_segment(segment))
-
+    
     valid_segments = [s for s in split_segments if s['end'] > s['start'] and s['text'].strip()]
-
+    
     # Split long segments and sort
     valid_long_segments = Segment.split_long_segments(valid_segments)
     sorted_splitted_long_segments = sorted(valid_long_segments, key=lambda x: x['start'])
-
-
-
+    
     for highlight_idx, highlight in enumerate(response_message, 1):
         print(f"\n{'='*50}")
         print(f"PROCESSING HIGHLIGHT {highlight_idx}/{len(response_message)}")
         print(f"Highlight Text: {highlight[:150]}...")
-
-    selected = highlight_obj.select_segments_for_highlight(highlight, sorted_splitted_long_segments, used_intervals, model, similarity_threshold, MAX_SEGMENTS_PER_HIGHLIGHT, MIN_TIME_GAP)
-
-    print(f"\nSelected Segments ({len(selected)}):")
-    for seg in selected:
-        start = max(0, seg['start'] - 1)
-        end = min(seg['end'] + 1, video_duration)
-        print(f"• {start:.1f}s-{end:.1f}s ({end-start:.1f}s) | {seg['text'][:50]}...")
-
-    for seg in selected:
-        start = max(0, seg['start'] - 1)
-        end = min(seg['end'] + 1, video_duration)
-        if end - start > max_clip_duration:
-            end = start + max_clip_duration
-        highlight_segments.append({
-            'text': highlight,
-            'start': start,
-            'end': end
-        })
-
-
+        
+        selected = highlight_obj.select_segments_for_highlight(
+            highlight, 
+            sorted_splitted_long_segments, 
+            used_intervals, 
+            model, 
+            similarity_threshold, 
+            MAX_SEGMENTS_PER_HIGHLIGHT, 
+            MIN_TIME_GAP
+        )
+        
+        if selected:
+            print(f"\nSelected Segments ({len(selected)}):")
+            for seg in selected:
+                start = max(0, seg['start'] - 1)
+                end = min(seg['end'] + 1, video_duration)
+                print(f"• {start:.1f}s-{end:.1f}s ({end-start:.1f}s) | {seg['text'][:50]}...")
+                
+                highlight_segments.append({
+                    'text': highlight,
+                    'start': start,
+                    'end': end
+                })
+        else:
+            print(f"\nNo segments found for highlight {highlight_idx}. Trying with lower threshold...")
+            # Try again with lower threshold for important moments
+            selected = highlight_obj.select_segments_for_highlight(
+                highlight, 
+                sorted_splitted_long_segments, 
+                used_intervals, 
+                model, 
+                similarity_threshold * 0.7,  # Lower threshold for retry
+                MAX_SEGMENTS_PER_HIGHLIGHT, 
+                MIN_TIME_GAP
+            )
+            if selected:
+                print(f"\nSelected Segments with lower threshold ({len(selected)}):")
+                for seg in selected:
+                    start = max(0, seg['start'] - 1)
+                    end = min(seg['end'] + 1, video_duration)
+                    print(f"• {start:.1f}s-{end:.1f}s ({end-start:.1f}s) | {seg['text'][:50]}...")
+                    
+                    highlight_segments.append({
+                        'text': highlight,
+                        'start': start,
+                        'end': end
+                    })
+    
     filtered_highlight_segments = [
         segment for segment in highlight_segments
         if segment['end'] - segment['start'] >= min_clip_duration
@@ -258,16 +376,11 @@ def main():
         filtered_highlight_segments,
         key=lambda x: x['start']
     )
-
+    
     if filtered_highlight_segments:
         highlight_obj.create_highlight_video(filtered_highlight_segments, process.video_path)
     else:
         print("No highlights generated.")
-  
-if __name__ == "__main__":
-  main()
 
-# # https://youtu.be/3ec3B0cjOMs?si=6uccJDZ_HIxLNK7o (mini english podcast)
-# # https://youtu.be/n4LCbWCshdw?si=NmRfL9l1vH5C1R03 (baris ozcan)
-# # https://youtu.be/Gc0yVaM-ADY?si=X0oxq2IpmnYjPE4o (gs)
-# # https://youtu.be/aKSHgMqCwbQ?si=wAL3xcFxorOkgCoQ (spain)
+if __name__ == "__main__":
+    main()
