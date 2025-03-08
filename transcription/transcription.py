@@ -18,18 +18,21 @@ class VideoTranscriber:
 
 
   def download_video(self, url: str, download: bool=False) -> str:
-    file_name = re.sub(r'[<>:"/\\|?*]', '', url.split("/")[-1]).strip()  # Fazladan boşlukları temizle
+    file_name = re.sub(r'[<>:"/\\|?*]', '', url.split("/")[-1]).strip()  # Clean extra spaces
     file_path = os.path.join(self.download_dir, file_name + ".mp4")
 
-    ydl_opts = {
-        "format": "bestvideo+bestaudio/best",  
-        "merge_output_format": "mp4",         
-        "outtmpl": file_path                    
-    }
+    # Check if file exists when download is True
     if download:
+      if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Video file not found at: {file_path}")
       return file_path
  
     else:
+      ydl_opts = {
+          "format": "bestvideo+bestaudio/best",  
+          "merge_output_format": "mp4",         
+          "outtmpl": file_path                    
+      }
       with yt_dlp.YoutubeDL(ydl_opts) as ydl:
           ydl.download([url])
 
